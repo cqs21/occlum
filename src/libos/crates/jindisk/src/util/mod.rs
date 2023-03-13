@@ -3,12 +3,14 @@ pub mod cryption;
 mod disk_array;
 mod disk_range;
 mod disk_view;
+mod disk_shadow;
 mod range_query_ctx;
 pub mod serialize;
 
 pub(crate) use disk_array::DiskArray;
 pub(crate) use disk_range::{HbaRange, LbaRange};
 pub(crate) use disk_view::DiskView;
+pub(crate) use disk_shadow::DiskShadow;
 pub(crate) use range_query_ctx::RangeQueryCtx;
 
 pub type BitMap = bitvec::prelude::BitVec<u8, bitvec::prelude::Lsb0>;

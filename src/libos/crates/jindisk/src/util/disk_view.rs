@@ -14,11 +14,15 @@ pub struct DiskView {
 impl DiskView {
     pub fn new(boundary: HbaRange, disk: Arc<dyn BlockDevice>) -> Self {
         debug_assert!(
-            (boundary.end().to_raw() as usize) < disk.total_blocks() && !boundary.is_empty(),
+            (boundary.end().to_raw() as usize) <= disk.total_blocks() && !boundary.is_empty(),
             "check boundary failed: {:?}",
             boundary
         );
         Self { boundary, disk }
+    }
+
+    pub fn boundary(&self) -> &HbaRange {
+        &self.boundary
     }
 
     pub fn submit(&self, req: Arc<BioReq>) -> Result<BioSubmission> {
