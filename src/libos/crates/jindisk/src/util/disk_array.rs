@@ -1,6 +1,7 @@
 //! Disk array.
 use crate::data::DataBlock;
 use crate::prelude::*;
+use super::disk_shadow::DiskShadow;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -8,25 +9,21 @@ use std::mem::size_of;
 
 /// Disk array that manages on-disk structures.
 pub struct DiskArray<T> {
-    start_addr: Hba,
-    table: HashMap<Hba, DataBlock>,
-    disk: DiskView,
+    cache: HashMap<Hba, DataBlock>,
+    disk: DiskShadow,
     phantom: PhantomData<T>,
 }
 
 impl<T: Serialize> DiskArray<T> {
-    pub fn new(start_addr: Hba, disk: DiskView) -> Self {
+    pub fn new(disk: DiskShadow) -> Self {
         Self {
-            start_addr,
-            table: HashMap::new(),
+            cache: HashMap::new(),
             disk,
             phantom: PhantomData,
         }
     }
 
     pub async fn get(&mut self, offset: usize) -> Option<T> {
-        self.check_offset(offset);
-
         let (hba, inner_offset) = self.hba_and_inner_offset(offset);
         let data_block = self.load_block(hba).await.ok()?;
 
@@ -34,8 +31,6 @@ impl<T: Serialize> DiskArray<T> {
     }
 
     pub async fn set(&mut self, offset: usize, unit: T) -> Result<()> {
-        self.check_offset(offset);
-
         let (hba, inner_offset) = self.hba_and_inner_offset(offset);
         let data_block = self.load_block(hba).await?;
 
@@ -47,42 +42,64 @@ impl<T: Serialize> DiskArray<T> {
     }
 
     fn hba_and_inner_offset(&self, offset: usize) -> (Hba, usize) {
-        let size = offset * Self::unit_size();
+        let unit_per_block = Self::unit_per_block();
+        let mut block_offset = (offset / unit_per_block) as u64;
         (
-            self.start_addr + Hba::from_byte_offset(align_down(size, BLOCK_SIZE)).to_raw(),
-            size % BLOCK_SIZE,
+            self.disk.boundary().start() + block_offset,
+            (offset % unit_per_block) * Self::unit_size(),
         )
     }
 
     async fn load_block(&mut self, hba: Hba) -> Result<&mut DataBlock> {
-        if !self.table.contains_key(&hba) {
+        if !self.cache.contains_key(&hba) {
             let mut data_block = DataBlock::new_uninit();
             self.disk.read(hba, data_block.as_slice_mut()).await?;
-            let _ = self.table.insert(hba, data_block);
+            self.cache.insert(hba, data_block);
         }
-
-        Ok(self.table.get_mut(&hba).unwrap())
+        Ok(self.cache.get_mut(&hba).unwrap())
     }
 
-    pub fn unit_size() -> usize {
-        size_of::<T>()
+    fn unit_size() -> usize {
+        let size = size_of::<T>();
+        debug_assert!(size > 0 && size <= BLOCK_SIZE);
+        size
     }
 
-    pub fn table_size(&self) -> usize {
-        self.table.len()
+    fn unit_per_block() -> usize {
+        BLOCK_SIZE / Self::unit_size()
     }
 
-    fn check_offset(&self, offset: usize) {
-        debug_assert!(
-            self.start_addr.to_offset() + offset * Self::unit_size() <= self.disk.total_bytes()
-        )
+    pub fn total_blocks(nr_units: usize) -> usize {
+        let mut nr_blocks = 0;
+        if nr_units != 0 {
+            nr_blocks = (nr_units - 1) / Self::unit_per_block() + 1;
+        }
+        nr_blocks
     }
 
-    pub async fn persist(&self, _root_key: &Key) -> Result<()> {
+    pub fn total_blocks_with_shadow(nr_units: usize) -> usize {
+        let nr_blocks = Self::total_blocks(nr_units);
+        DiskShadow::total_blocks_with_shadow(nr_blocks)
+    }
+
+    pub fn cache_size(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub async fn persist(&self, _key: &Key) -> Result<()> {
         // TODO: Add encryption(symmetric) for blocks
-        for (hba, block) in self.table.iter() {
+        for (hba, block) in self.cache.iter() {
             self.disk.write(*hba, block.as_slice()).await?;
         }
         Ok(())
+    }
+
+    pub async fn checkpoint(&mut self, _key: &Key) -> Result<bool> {
+        // TODO: Add encryption(symmetric) for blocks
+        for (hba, block) in self.cache.iter() {
+            self.disk.write(*hba, block.as_slice()).await?;
+            self.disk.mark_dirty(*hba);
+        }
+        self.disk.checkpoint().await
     }
 }

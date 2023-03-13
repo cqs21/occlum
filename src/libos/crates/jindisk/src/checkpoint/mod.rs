@@ -1,6 +1,7 @@
 //! Checkpoint region.
 use crate::prelude::*;
 use crate::SuperBlock;
+use crate::util::DiskShadow;
 
 use std::fmt::{self, Debug};
 
@@ -31,6 +32,11 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn new(superblock: &SuperBlock, disk: DiskView) -> Self {
+        let rit_addr = superblock.checkpoint_region.rit_addr;
+        let rit_blocks = RIT::calc_rit_blocks(superblock.num_data_segments);
+        let rit_boundary = HbaRange::new(
+            rit_addr..rit_addr + (rit_blocks as u64)
+        );
         Self {
             bitc: RwLock::new(BITC::new()),
             data_svt: RwLock::new(SVT::new(
@@ -48,9 +54,9 @@ impl Checkpoint {
                 superblock.num_data_segments,
             )),
             rit: RwLock::new(RIT::new(
-                superblock.checkpoint_region.rit_addr,
                 superblock.data_region_addr,
-                disk.clone(),
+                rit_boundary,
+                disk.clone()
             )),
             key_table: KeyTable::new(superblock.data_region_addr),
             disk,
@@ -115,7 +121,14 @@ impl Checkpoint {
         let data_svt = SVT::load(disk, region.data_svt_addr, root_key).await?;
         let index_svt = SVT::load(disk, region.index_svt_addr, root_key).await?;
         let dst = DST::load(disk, region.dst_addr, root_key).await?;
-        let rit = RIT::load(disk, superblock.data_region_addr, region.rit_addr, root_key).await?;
+
+        let rit_addr = superblock.checkpoint_region.rit_addr;
+        let rit_blocks = RIT::calc_rit_blocks(superblock.num_data_segments);
+        let rit_boundary = HbaRange::new(
+            rit_addr..rit_addr + (rit_blocks as u64)
+        );
+        let rit = RIT::load(superblock.data_region_addr, rit_boundary, disk.clone(), false).await?;
+
         let key_table = KeyTable::load(disk, region.keytable_addr, root_key).await?;
 
         Ok(Self {
