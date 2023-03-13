@@ -2,11 +2,13 @@
 use crate::prelude::*;
 use cfg_if::cfg_if;
 #[cfg(not(feature = "sgx"))]
-use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
+use openssl::symm::{encrypt, decrypt, decrypt_aead, encrypt_aead, Cipher};
 #[cfg(feature = "sgx")]
 use sgx_rand::{thread_rng, Rng};
 #[cfg(feature = "sgx")]
 use sgx_tcrypto::{rsgx_rijndael128GCM_decrypt, rsgx_rijndael128GCM_encrypt};
+#[cfg(feature = "sgx")]
+use sgx_tcrypto::{rsgx_aes_ctr_encrypt, rsgx_aes_ctr_decrypt};
 #[cfg(feature = "sgx")]
 use sgx_types::sgx_status_t;
 
@@ -37,6 +39,12 @@ pub trait Cryption {
         key: &Key,
         meta: &CipherMeta,
     ) -> Result<()>;
+
+    /// Encrypt a block using symmetric key cipher(AES128 CTR mode)
+    fn symm_encrypt_block(data: &[u8], key: &Key) -> Result<[u8; BLOCK_SIZE]>;
+
+    /// Decrypt a block using symmetric key cipher(AES128 CTR mode)
+    fn symm_decrypt_block(data: &[u8], key: &Key) -> Result<[u8; BLOCK_SIZE]>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +121,14 @@ impl Cryption for DefaultCryptor {
         meta: &CipherMeta,
     ) -> Result<()> {
         Self::dec_any(ciphertext, plaintext, key, meta)
+    }
+
+    fn symm_encrypt_block(data: &[u8], key: &Key) -> Result<[u8; BLOCK_SIZE]> {
+        Self::symm_enc_block(data, key)
+    }
+
+    fn symm_decrypt_block(data: &[u8], key: &Key) -> Result<[u8; BLOCK_SIZE]> {
+        Self::symm_dec_block(data, key)
     }
 }
 
@@ -264,6 +280,62 @@ impl DefaultCryptor {
         }
         Ok(())
     }
+
+    fn symm_enc_block(data: &[u8], key: &Key) -> Result<[u8; BLOCK_SIZE]> {
+        let mut output = [0u8; BLOCK_SIZE];
+        let ctr = [2u8; 16];
+
+        cfg_if! {
+            // AES128-CTR
+            if #[cfg(feature = "sgx")] {
+                let ctr_inc_bits = 128u32;
+                match rsgx_aes_ctr_encrypt(key, data, &ctr, ctr_inc_bits, &mut output) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        return_errno!(EINVAL, "SGX: rsgx_aes_ctr_encrypt error")
+                    }
+                }
+            } else {
+                match encrypt(Cipher::aes_128_ctr(), key, Some(&ctr), data) {
+                    Ok(ciphertext) => {
+                        output.copy_from_slice(&ciphertext);
+                    },
+                    Err(_) => {
+                        return_errno!(EINVAL, "OPENSSL: aes_128_ctr encryption error");
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn symm_dec_block(data: &[u8], key: &Key) -> Result<[u8; BLOCK_SIZE]> {
+        let mut output = [0u8; BLOCK_SIZE];
+        let ctr = [2u8; 16];
+
+        cfg_if! {
+            // AES128-CTR
+            if #[cfg(feature = "sgx")] {
+                let ctr_inc_bits = 128u32;
+                match rsgx_aes_ctr_decrypt(key, data, &ctr, ctr_inc_bits, &mut output) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        return_errno!(EINVAL, "SGX: rsgx_aes_ctr_decrypt error")
+                    }
+                }
+            } else {
+                match decrypt(Cipher::aes_128_ctr(), key, Some(&ctr), data) {
+                    Ok(ciphertext) => {
+                        output.copy_from_slice(&ciphertext);
+                    },
+                    Err(_) => {
+                        return_errno!(EINVAL, "OPENSSL: aes_128_ctr decryption error");
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
 }
 
 impl Encoder for Mac {
@@ -301,5 +373,15 @@ mod tests {
         let mut decrypted = [0u8; SIZE];
         let _ = DefaultCryptor::decrypt_arbitrary(&cipher, &mut decrypted, &key, &cipher_meta);
         assert_eq!(plain, decrypted);
+    }
+
+    #[test]
+    fn test_symm_enc_dec() {
+        let key = DefaultCryptor::gen_random_key();
+        let plaintext = [0u8; BLOCK_SIZE];
+        let ciphertext = DefaultCryptor::symm_encrypt_block(&plaintext, &key).unwrap();
+        assert_ne!(plaintext, ciphertext);
+        let decrypted = DefaultCryptor::symm_decrypt_block(&ciphertext, &key).unwrap();
+        assert_eq!(plaintext, decrypted);
     }
 }
