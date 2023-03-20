@@ -3,6 +3,7 @@ use crate::prelude::*;
 use cfg_if::cfg_if;
 #[cfg(not(feature = "sgx"))]
 use openssl::symm::{encrypt, decrypt, decrypt_aead, encrypt_aead, Cipher};
+use openssl::rand::rand_bytes;
 #[cfg(feature = "sgx")]
 use sgx_rand::{thread_rng, Rng};
 #[cfg(feature = "sgx")]
@@ -137,8 +138,13 @@ impl DefaultCryptor {
     #[allow(unused_mut)]
     pub fn gen_random_key() -> Key {
         let mut rand_key = [5u8; AUTH_ENC_KEY_SIZE];
-        #[cfg(feature = "sgx")]
-        thread_rng().fill_bytes(&mut rand_key);
+        cfg_if! {
+            if #[cfg(feature = "sgx")] {
+                thread_rng().fill_bytes(&mut rand_key);
+            } else {
+                rand_bytes(&mut rand_key);
+            }
+        }
         rand_key
     }
 
