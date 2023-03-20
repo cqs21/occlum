@@ -55,7 +55,16 @@ pub struct CheckpointRegion {
     pub keytable_size: usize,
 
     pub total_size: usize,
+    pub shadow: [bool; NR_REGION_MAX],
 }
+
+pub const NR_BITC: usize = 0;
+pub const NR_DATA_SVT: usize = 1;
+pub const NR_INDEX_SVT: usize = 2;
+pub const NR_DST: usize = 3;
+pub const NR_RIT: usize = 4;
+pub const NR_KEYTABLE: usize = 5;
+pub const NR_REGION_MAX: usize = 6;
 
 impl SuperBlock {
     /// Initialize superblock metadata (Calculate disk layout and region size).
@@ -145,6 +154,7 @@ impl CheckpointRegion {
         let rit_addr = dst_addr + Hba::from_byte_offset_aligned(dst_size).unwrap().to_raw();
         let keytable_addr = rit_addr + Hba::from_byte_offset_aligned(rit_size).unwrap().to_raw();
         let total_size = keytable_addr.to_offset() + keytable_size - region_addr.to_offset();
+        let mut shadow = [false; NR_REGION_MAX];
 
         Self {
             region_addr,
@@ -163,6 +173,7 @@ impl CheckpointRegion {
             keytable_size,
 
             total_size,
+            shadow
         }
     }
 }

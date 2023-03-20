@@ -1,6 +1,8 @@
 //! Data Segment Table (DST).
 use super::BitMap;
 use crate::prelude::*;
+use crate::util::DiskShadow;
+use crate::util::Byte;
 
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
@@ -17,11 +19,18 @@ pub struct DST {
     // Idx: Number of valid blocks
     // V: Set of data segment start hba
     validity_tracker: [HashSet<Hba>; NUM_BLOCKS_PER_SEGMENT + 1],
+    disk_array: DiskArray<Byte>
 }
 // TODO: Adapt threaded logging
 
 impl DST {
-    pub fn new(data_region_addr: Hba, num_data_segments: usize) -> Self {
+    pub fn new(
+        data_region_addr: Hba,
+        num_data_segments: usize,
+        dst_boundary: HbaRange,
+        disk: DiskView,
+        key: Key
+    ) -> Self {
         Self {
             region_addr: data_region_addr,
             num_segments: num_data_segments,
@@ -29,6 +38,10 @@ impl DST {
             validity_tracker: vec![HashSet::new(); NUM_BLOCKS_PER_SEGMENT + 1]
                 .try_into()
                 .unwrap(),
+            disk_array: DiskArray::new(
+                DiskShadow::new(dst_boundary, disk),
+                key
+            )
         }
     }
 
@@ -135,7 +148,12 @@ impl DST {
         invalid_blocks
     }
 
-    fn from(region_addr: Hba, num_segments: usize, bitmaps: HashMap<Hba, BitMap>) -> Self {
+    fn from(
+        region_addr: Hba,
+        num_segments: usize,
+        bitmaps: HashMap<Hba, BitMap>,
+        disk_array: DiskArray<Byte>
+    ) -> Self {
         let mut validity_tracker: [HashSet<Hba>; NUM_BLOCKS_PER_SEGMENT + 1] =
             vec![HashSet::new(); NUM_BLOCKS_PER_SEGMENT + 1]
                 .try_into()
@@ -153,6 +171,7 @@ impl DST {
             num_segments,
             bitmaps,
             validity_tracker,
+            disk_array
         }
     }
 
@@ -164,14 +183,24 @@ impl DST {
             + self.region_addr.to_raw()
     }
 
-    /// Calculate space cost on disk.
+    fn calc_diskarray_offset(&self, block_addr: Hba) -> usize {
+        let block_offset = (block_addr.to_raw() - self.region_addr.to_raw()) as usize;
+        block_offset / BITMAP_UNIT
+    }
+
+    /// Calculate DST blocks without shadow block
+    pub fn calc_dst_blocks(num_data_segments: usize) -> usize {
+        let nr_bits = num_data_segments * NUM_BLOCKS_PER_SEGMENT;
+        let nr_units = align_up(nr_bits, BITMAP_UNIT) / BITMAP_UNIT;
+        DiskArray::<Byte>::total_blocks(nr_units)
+    }
+
+    /// Calculate space cost in bytes (with shadow blocks) on disk.
     pub fn calc_size_on_disk(num_data_segments: usize) -> usize {
-        let size = BA_SIZE
-            + USIZE_SIZE
-            + num_data_segments * (BA_SIZE + NUM_BLOCKS_PER_SEGMENT / BITMAP_UNIT)
-            + AUTH_ENC_MAC_SIZE
-            + USIZE_SIZE;
-        align_up(size, BLOCK_SIZE)
+        let nr_bits = num_data_segments * NUM_BLOCKS_PER_SEGMENT;
+        let nr_units = align_up(nr_bits, BITMAP_UNIT) / BITMAP_UNIT;
+        let total_blocks = DiskArray::<Byte>::total_blocks_with_shadow(nr_units);
+        total_blocks * BLOCK_SIZE
     }
 }
 
@@ -198,41 +227,67 @@ impl VictimSegment {
     }
 }
 
-impl Serialize for DST {
-    fn encode(&self, encoder: &mut impl Encoder) -> Result<()> {
-        self.region_addr.encode(encoder)?;
-        self.num_segments.encode(encoder)?;
-        let bitmaps: HashMap<Hba, BitMap> = self
-            .bitmaps
-            .iter()
-            .map(|(seg_addr, (bitmap, _))| (*seg_addr, bitmap.clone()))
-            .collect();
-        bitmaps.encode(encoder)
+impl DST {
+    pub async fn persist(&self) -> Result<()> {
+        self.disk_array.persist().await
     }
 
-    fn decode(buf: &[u8]) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let mut offset = 0;
-        let region_addr = Hba::decode(&buf[offset..offset + BA_SIZE])?;
-        offset += BA_SIZE;
-        let num_segments = usize::decode(&buf[offset..offset + USIZE_SIZE])?;
-        offset += USIZE_SIZE;
-        let bitmaps = HashMap::<Hba, BitMap>::decode(&buf[offset..])?;
+    pub async fn load(
+        data_region_addr: Hba,
+        num_data_segments: usize,
+        dst_boundary: HbaRange,
+        disk: DiskView,
+        key: Key,
+        shadow: bool
+    ) -> Result<Self> {
+        let disk_shadow = DiskShadow::load(dst_boundary, disk, shadow).await?;
+        let mut disk_array = DiskArray::new(disk_shadow, key);
 
-        Ok(DST::from(region_addr, num_segments, bitmaps))
+        let mut bitmaps = HashMap::with_capacity(num_data_segments);
+        for i in 0..num_data_segments {
+            let seg_addr = data_region_addr + (i as _);
+            let mut bitmap = BitMap::with_capacity(NUM_BLOCKS_PER_SEGMENT);
+            for j in 0..(NUM_BLOCKS_PER_SEGMENT / BITMAP_UNIT) {
+                let offset = i * (NUM_BLOCKS_PER_SEGMENT / BITMAP_UNIT) + j;
+                let value = disk_array.get(offset).await.ok_or(
+                    errno!(EIO, "dst disk_array read error")
+                )?;
+                bitmap.extend_from_raw_slice(&[value]);
+            }
+            bitmaps.insert(seg_addr, bitmap);
+        }
+
+        Ok(DST::from(
+            data_region_addr,
+            num_data_segments,
+            bitmaps,
+            disk_array
+        ))
+    }
+
+    pub async fn checkpoint(&mut self) -> Result<bool> {
+        let bitmaps: HashMap<Hba, BitMap> = self.bitmaps
+                .iter()
+                .map(|(seg_addr, (bitmap, _))|(*seg_addr, bitmap.clone()))
+                .collect();
+        for (seg_addr, bitmap) in bitmaps.iter() {
+            for i in 0..bitmap.as_raw_slice().len() {
+                let block_addr = *seg_addr + ((i * BITMAP_UNIT) as _);
+                let offset = self.calc_diskarray_offset(block_addr);
+                let value = bitmap.as_raw_slice()[i];
+                self.disk_array.set(offset, value).await;
+            }
+        }
+        self.disk_array.checkpoint().await
     }
 }
-
-crate::persist_load_checkpoint_region! {DST}
 
 impl Debug for DST {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Checkpoint::DST (Data Segment Table)")
             .field("region_addr", &self.region_addr)
             .field("num_segments", &self.num_segments)
-            .field("bitmaps_size", &self.bitmaps.len())
+            .field("bitmaps_capacity", &self.bitmaps.capacity())
             .finish()
     }
 }
@@ -253,7 +308,28 @@ mod tests {
 
     #[test]
     fn test_dst_fns() {
-        let mut dst = DST::new(Hba::new(0), 10usize);
+        let disk_blocks = 64 * MiB / BLOCK_SIZE;
+        let disk = Arc::new(MemDisk::new(disk_blocks).unwrap());
+        let disk = DiskView::new_unchecked(disk);
+
+        let region_addr = Hba::new(0);
+        let num_segments = 10usize;
+        let dst_blocks = DST::calc_dst_blocks(num_segments);
+        let dst_blocks_with_shadow = DST::calc_size_on_disk(num_segments) / BLOCK_SIZE;
+        assert_eq!(dst_blocks, 1);
+        assert_eq!(dst_blocks_with_shadow, 4);
+
+        let dst_start = region_addr + (NUM_BLOCKS_PER_SEGMENT * num_segments) as _;
+        let dst_end = dst_start + (dst_blocks as _);
+        let dst_boundary = HbaRange::new(dst_start..dst_end);
+        let key = DefaultCryptor::gen_random_key();
+        let mut dst = DST::new(
+            region_addr,
+            num_segments,
+            dst_boundary,
+            disk,
+            key
+        );
 
         let seg1 = Hba::new(0);
         let seg2 = Hba::from_byte_offset(1 * SEGMENT_SIZE);
@@ -280,40 +356,48 @@ mod tests {
     }
 
     #[test]
-    fn test_dst_serialize() {
-        let region_addr = Hba::new(1);
-        let mut dst = DST::new(region_addr, 5usize);
-
-        let seg1 = Hba::new(0);
-        let seg2 = Hba::from_byte_offset(1 * SEGMENT_SIZE);
-        dst.validate_or_insert(seg1);
-        dst.validate_or_insert(seg2);
-
-        let mut bytes = Vec::new();
-        dst.encode(&mut bytes).unwrap();
-        let decoded_dst = DST::decode(&bytes).unwrap();
-
-        assert_eq!(decoded_dst.region_addr, region_addr);
-        assert!(decoded_dst.bitmaps.contains_key(&seg1) && decoded_dst.bitmaps.contains_key(&seg2));
-        let offset = 42;
-        assert_eq!(
-            format!("{:?}", dst)[..offset],
-            format!("{:?}", decoded_dst)[..offset]
-        );
-    }
-
-    #[test]
     fn test_dst_persist_load() -> Result<()> {
         async_rt::task::block_on(async move {
-            let dst = DST::new(Hba::new(0), 8usize);
-            let disk = Arc::new(MemDisk::new(1024usize).unwrap());
+            let disk_blocks = 64 * MiB / BLOCK_SIZE;
+            let disk = Arc::new(MemDisk::new(disk_blocks).unwrap());
             let disk = DiskView::new_unchecked(disk);
 
-            let root_key = DefaultCryptor::gen_random_key();
-            dst.persist(&disk, Hba::new(0), &root_key).await?;
-            let loaded_dst = DST::load(&disk, Hba::new(0), &root_key).await?;
+            let region_addr = Hba::new(0);
+            let num_segments = 10usize;
+            let dst_start = region_addr + (NUM_BLOCKS_PER_SEGMENT * num_segments) as _;
+            let dst_end = dst_start + (DST::calc_dst_blocks(num_segments) as _);
+            let key = DefaultCryptor::gen_random_key();
+            let mut dst = DST::new(
+                region_addr,
+                num_segments,
+                HbaRange::new(dst_start..dst_end),
+                disk.clone(),
+                key.clone()
+            );
 
-            assert_eq!(format!("{:?}", dst), format!("{:?}", loaded_dst));
+            let blocks = [region_addr, region_addr + 1 as _];
+            dst.validate_or_insert(region_addr);
+            dst.update_validity(&blocks, false);
+
+            let (bitmap, num_valid) = dst.bitmaps.get(&region_addr).unwrap();
+            let value = bitmap.as_raw_slice()[0];
+            assert_eq!(value, 0b1111_1100);
+            assert_eq!(*num_valid, 1022usize);
+
+            dst.checkpoint().await?;
+
+            let loaded_dst = DST::load(
+                region_addr,
+                num_segments,
+                HbaRange::new(dst_start..dst_end),
+                disk,
+                key,
+                true
+            ).await?;
+
+            let (bitmap, num_valid) = loaded_dst.bitmaps.get(&region_addr).unwrap();
+            assert_eq!(value, 0b1111_1100);
+            assert_eq!(*num_valid, 1022usize);
             Ok(())
         })
     }

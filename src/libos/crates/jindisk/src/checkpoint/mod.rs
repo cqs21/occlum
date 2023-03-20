@@ -1,6 +1,10 @@
 //! Checkpoint region.
 use crate::prelude::*;
 use crate::SuperBlock;
+use crate::superblock::NR_DATA_SVT;
+use crate::superblock::NR_DST;
+use crate::superblock::NR_INDEX_SVT;
+use crate::superblock::NR_RIT;
 use crate::util::DiskShadow;
 
 use std::fmt::{self, Debug};
@@ -31,32 +35,61 @@ pub struct Checkpoint {
 // TODO: Introduce shadow paging for recovery
 
 impl Checkpoint {
-    pub fn new(superblock: &SuperBlock, disk: DiskView) -> Self {
+    pub fn new(superblock: &SuperBlock, disk: DiskView, root_key: &Key) -> Self {
         let rit_addr = superblock.checkpoint_region.rit_addr;
         let rit_blocks = RIT::calc_rit_blocks(superblock.num_data_segments);
         let rit_boundary = HbaRange::new(
-            rit_addr..rit_addr + (rit_blocks as u64)
+            rit_addr..rit_addr + (rit_blocks as _)
         );
+
+        let data_svt_addr = superblock.checkpoint_region.data_svt_addr;
+        let data_svt_blocks = SVT::calc_svt_blocks(superblock.num_data_segments);
+        let data_svt_boundary = HbaRange::new(
+            data_svt_addr..data_svt_addr + (data_svt_blocks as _)
+        );
+
+        let index_svt_addr = superblock.checkpoint_region.index_svt_addr;
+        let index_svt_blocks = SVT::calc_svt_blocks(superblock.num_index_segments);
+        let index_svt_boundary = HbaRange::new(
+            index_svt_addr..index_svt_addr + (index_svt_blocks as _)
+        );
+
+        let dst_addr = superblock.checkpoint_region.dst_addr;
+        let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
+        let dst_boundary = HbaRange::new(
+            dst_addr..dst_addr + (dst_blocks as _)
+        );
+
         Self {
             bitc: RwLock::new(BITC::new()),
             data_svt: RwLock::new(SVT::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
                 SEGMENT_SIZE,
+                data_svt_boundary,
+                disk.clone(),
+                root_key.clone()
             )),
             index_svt: RwLock::new(SVT::new(
                 superblock.index_region_addr,
                 superblock.num_index_segments,
                 INDEX_SEGMENT_SIZE,
+                index_svt_boundary,
+                disk.clone(),
+                root_key.clone()
             )),
             dst: RwLock::new(DST::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
+                dst_boundary,
+                disk.clone(),
+                root_key.clone()
             )),
             rit: RwLock::new(RIT::new(
                 superblock.data_region_addr,
                 rit_boundary,
-                disk.clone()
+                disk.clone(),
+                root_key.clone()
             )),
             key_table: KeyTable::new(superblock.data_region_addr),
             disk,
@@ -97,17 +130,17 @@ impl Checkpoint {
             .await?;
         self.data_svt
             .write()
-            .persist(&self.disk, region.data_svt_addr, root_key)
+            .persist()
             .await?;
         self.index_svt
             .write()
-            .persist(&self.disk, region.index_svt_addr, root_key)
+            .persist()
             .await?;
         self.dst
             .write()
-            .persist(&self.disk, region.dst_addr, root_key)
+            .persist()
             .await?;
-        self.rit.write().persist(root_key).await?;
+        self.rit.write().persist().await?;
         self.key_table
             .persist(&self.disk, region.keytable_addr, root_key)
             .await?;
@@ -118,16 +151,63 @@ impl Checkpoint {
         let region = &superblock.checkpoint_region;
         let bitc = BITC::load(disk, region.bitc_addr, root_key).await?;
         bitc.init_bit_caches(disk).await?;
-        let data_svt = SVT::load(disk, region.data_svt_addr, root_key).await?;
-        let index_svt = SVT::load(disk, region.index_svt_addr, root_key).await?;
-        let dst = DST::load(disk, region.dst_addr, root_key).await?;
+
+        let data_svt_addr = superblock.checkpoint_region.data_svt_addr;
+        let data_svt_blocks = SVT::calc_svt_blocks(superblock.num_data_segments);
+        let data_svt_boundary = HbaRange::new(
+            data_svt_addr..data_svt_addr + (data_svt_blocks as _)
+        );
+        let data_svt = SVT::load(
+            superblock.data_region_addr,
+            superblock.num_data_segments,
+            SEGMENT_SIZE,
+            data_svt_boundary,
+            disk.clone(),
+            root_key.clone(),
+            superblock.checkpoint_region.shadow[NR_DATA_SVT]
+        ).await?;
+
+        let index_svt_addr = superblock.checkpoint_region.index_svt_addr;
+        let index_svt_blocks = SVT::calc_svt_blocks(superblock.num_index_segments);
+        let index_svt_boundary = HbaRange::new(
+            index_svt_addr..index_svt_addr + (index_svt_blocks as _)
+        );
+        let index_svt = SVT::load(
+            superblock.index_region_addr,
+            superblock.num_index_segments,
+            INDEX_SEGMENT_SIZE,
+            index_svt_boundary,
+            disk.clone(),
+            root_key.clone(),
+            superblock.checkpoint_region.shadow[NR_INDEX_SVT]
+        ).await?;
+
+        let dst_addr = superblock.checkpoint_region.dst_addr;
+        let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
+        let dst_boundary = HbaRange::new(
+            dst_addr..dst_addr + (dst_blocks as _)
+        );
+        let dst = DST::load(
+            superblock.data_region_addr,
+            superblock.num_data_segments,
+            dst_boundary,
+            disk.clone(),
+            root_key.clone(),
+            superblock.checkpoint_region.shadow[NR_DST]
+        ).await?;
 
         let rit_addr = superblock.checkpoint_region.rit_addr;
         let rit_blocks = RIT::calc_rit_blocks(superblock.num_data_segments);
         let rit_boundary = HbaRange::new(
-            rit_addr..rit_addr + (rit_blocks as u64)
+            rit_addr..rit_addr + (rit_blocks as _)
         );
-        let rit = RIT::load(superblock.data_region_addr, rit_boundary, disk.clone(), false).await?;
+        let rit = RIT::load(
+            superblock.data_region_addr,
+            rit_boundary,
+            disk.clone(),
+            root_key.clone(),
+            superblock.checkpoint_region.shadow[NR_RIT]
+        ).await?;
 
         let key_table = KeyTable::load(disk, region.keytable_addr, root_key).await?;
 
@@ -140,6 +220,22 @@ impl Checkpoint {
             key_table,
             disk: disk.clone(),
         })
+    }
+    pub async fn checkpoint(&mut self, superblock: &mut SuperBlock, root_key: &Key) -> Result<()> {
+        superblock.checkpoint_region.shadow[NR_DATA_SVT] = self.data_svt.write().checkpoint().await?;
+        superblock.checkpoint_region.shadow[NR_INDEX_SVT] = self.index_svt.write().checkpoint().await?;
+        superblock.checkpoint_region.shadow[NR_DST] = self.dst.write().checkpoint().await?;
+        superblock.checkpoint_region.shadow[NR_RIT] = self.rit.write().checkpoint().await?;
+        // TODO: using checkpoint() for BITC, KeyTable
+        let region = &superblock.checkpoint_region;
+        self.bitc
+            .write()
+            .persist(&self.disk, region.bitc_addr, root_key)
+            .await?;
+        self.key_table
+            .persist(&self.disk, region.keytable_addr, root_key)
+            .await?;
+        Ok(())
     }
 }
 
@@ -227,9 +323,9 @@ mod tests {
             let disk = Arc::new(MemDisk::new(total_blocks).unwrap());
             let disk = DiskView::new_unchecked(disk);
             let root_key = DefaultCryptor::gen_random_key();
-            let sb = SuperBlock::init(total_blocks);
-            let checkpoint = Checkpoint::new(&sb, disk.clone());
-            checkpoint.persist(&sb, &root_key).await?;
+            let mut sb = SuperBlock::init(total_blocks);
+            let mut checkpoint = Checkpoint::new(&sb, disk.clone(), &root_key);
+            checkpoint.checkpoint(&mut sb, &root_key).await?;
             let loaded_checkpoint = Checkpoint::load(&disk, &sb, &root_key).await?;
 
             assert_eq!(

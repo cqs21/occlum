@@ -12,11 +12,16 @@ pub struct RIT {
 }
 
 impl RIT {
-    pub fn new(data_region_addr: Hba, boundary: HbaRange, disk: DiskView) -> Self {
-        let disk_shadow = DiskShadow::new(boundary, disk);
+    pub fn new(
+        data_region_addr: Hba,
+        rit_boundary: HbaRange,
+        disk: DiskView,
+        key: Key
+    ) -> Self {
+        let disk_shadow = DiskShadow::new(rit_boundary, disk);
         Self {
             data_region_addr,
-            disk_array: DiskArray::new(disk_shadow),
+            disk_array: DiskArray::new(disk_shadow, key),
         }
     }
 
@@ -61,25 +66,26 @@ impl RIT {
 }
 
 impl RIT {
-    pub async fn persist(&self, key: &Key) -> Result<()> {
-        self.disk_array.persist(key).await
+    pub async fn persist(&self) -> Result<()> {
+        self.disk_array.persist().await
     }
 
     pub async fn load(
         data_region_addr: Hba,
-        boundary: HbaRange,
+        rit_boundary: HbaRange,
         disk: DiskView,
+        key: Key,
         shadow: bool
     ) -> Result<Self> {
-        let disk_shadow = DiskShadow::load(boundary, disk, shadow).await?;
+        let disk_shadow = DiskShadow::load(rit_boundary, disk, shadow).await?;
         Ok(Self {
             data_region_addr,
-            disk_array: DiskArray::new(disk_shadow)
+            disk_array: DiskArray::new(disk_shadow, key)
         })
     }
 
-    pub async fn checkpoint(&mut self, key: &Key) -> Result<bool> {
-        self.disk_array.checkpoint(key).await
+    pub async fn checkpoint(&mut self) -> Result<bool> {
+        self.disk_array.checkpoint().await
     }
 }
 
@@ -107,15 +113,16 @@ mod tests {
             let num_data_segments = 8usize;
             let rit_blocks = RIT::calc_rit_blocks(num_data_segments);
             let rit_blocks_with_shadow = RIT::calc_size_on_disk(num_data_segments) / BLOCK_SIZE;
-            // data_blocks: (((32MiB / 4KiB) * 8B) / 4KiB) = 16, bitmap_blocks: 1
-            assert_eq!(rit_blocks, 16);
-            assert_eq!(rit_blocks_with_shadow, 34);
+            // data_blocks: align_up(((32MiB / 4KiB) * 8B) / (4KiB - 16)) = 17, bitmap_blocks: 1
+            assert_eq!(rit_blocks, 17);
+            assert_eq!(rit_blocks_with_shadow, 36);
 
-            let rit_start = data_region_addr + (NUM_BLOCKS_PER_SEGMENT * num_data_segments) as u64;
-            let rit_end = rit_start + (rit_blocks as u64);
+            let rit_start = data_region_addr + (NUM_BLOCKS_PER_SEGMENT * num_data_segments) as _;
+            let rit_end = rit_start + (rit_blocks as _);
             let boundary = HbaRange::new(rit_start..rit_end);
 
-            let mut rit = RIT::new(data_region_addr, boundary.clone(), disk.clone());
+            let key = DefaultCryptor::gen_random_key();
+            let mut rit = RIT::new(data_region_addr, boundary.clone(), disk.clone(), key.clone());
 
             let kv1 = (Hba::new(1), Lba::new(2));
             let kv2 = (Hba::new(1025), Lba::new(5));
@@ -129,8 +136,9 @@ mod tests {
             assert_eq!(rit.find_and_invalidate(kv2.0).await.unwrap(), kv2.1);
             assert_eq!(rit.check_valid(kv2.0, kv2.1).await, false);
 
-            // illegal Hba: 8192
-            let kv3 = (Hba::new(8192), Lba::new(0));
+            // FIXME: 17 rit_blocks can preserve Lba for Hba(17 * 510 - 1) at most,
+            // but actually Hba is legal only in [0, 8192).
+            let kv3 = (Hba::new(8670), Lba::new(0));
             match rit.insert(kv3.0, kv3.1).await {
                 Ok(_) => unreachable!(),
                 Err(e) => {
@@ -139,11 +147,10 @@ mod tests {
                 }
             }
 
-            let key = DefaultCryptor::gen_random_key();
-            rit.persist(&key).await?;
-            rit.checkpoint(&key).await?;
+            rit.persist().await?;
+            rit.checkpoint().await?;
 
-            let mut loaded_rit = RIT::load(data_region_addr, boundary, disk, true).await?;
+            let mut loaded_rit = RIT::load(data_region_addr, boundary, disk, key, true).await?;
             assert_eq!(loaded_rit.find_lba(kv1.0).await.unwrap(), kv1.1);
             assert_eq!(loaded_rit.check_valid(kv2.0, kv2.1).await, false);
             Ok(())

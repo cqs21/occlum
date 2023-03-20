@@ -26,7 +26,7 @@ impl DiskShadow {
         let nr_bitmap_bytes = (nr_blocks + BITMAP_UNIT - 1) / BITMAP_UNIT;
         let nr_bitmap_blocks = (nr_bitmap_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
         let total_blocks = (nr_blocks + nr_bitmap_blocks) * 2;
-        let end =  boundary.start() + (total_blocks as u64);
+        let end =  boundary.start() + (total_blocks as _);
         debug_assert!(
             (!boundary.is_empty() && end <= disk.boundary().end()),
             "DiskShadow check boundary failed: {:?}",
@@ -51,16 +51,16 @@ impl DiskShadow {
         let nr_bitmap_bytes = (nr_blocks + BITMAP_UNIT - 1) / BITMAP_UNIT;
         let nr_bitmap_blocks = (nr_bitmap_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
         let total_blocks = (nr_blocks + nr_bitmap_blocks) * 2;
-        let end =  boundary.start() + (total_blocks as u64);
+        let end =  boundary.start() + (total_blocks as _);
         debug_assert!(
             (!boundary.is_empty() && end <= disk.boundary().end()),
             "DiskShadow check boundary failed: {:?}",
             boundary
         );
 
-        let mut bitmap_addr = boundary.start() + (2 * nr_blocks as u64);
+        let mut bitmap_addr = boundary.start() + (2 * nr_blocks) as _;
         if shadow {
-            bitmap_addr = bitmap_addr + (nr_bitmap_blocks as u64);
+            bitmap_addr = bitmap_addr + (nr_bitmap_blocks as _);
         }
         let mut buffer = Vec::<u8>::with_capacity(nr_bitmap_blocks * BLOCK_SIZE);
         buffer.resize(nr_bitmap_blocks * BLOCK_SIZE, 0);
@@ -125,8 +125,8 @@ impl DiskShadow {
 
     fn bitmap_addr(&self, shadow: bool) -> Hba {
         let nr_blocks = self.boundary.num_covered_blocks();
-        let start = self.boundary.start() + (2 * nr_blocks as u64);
-        let nr_bitmap_blocks = self.nr_bitmap_blocks as u64;
+        let start = self.boundary.start() + (2 * nr_blocks) as _;
+        let nr_bitmap_blocks = self.nr_bitmap_blocks as _;
         if shadow {
             start + nr_bitmap_blocks
         } else {
@@ -182,7 +182,7 @@ mod tests {
     fn create_disk_view() -> DiskView {
         let total_blocks = 4 * MiB / BLOCK_SIZE;
         let disk = Arc::new(MemDisk::new(total_blocks).unwrap());
-        let range = HbaRange::new(Hba::new(0)..Hba::new(total_blocks as u64));
+        let range = HbaRange::new(Hba::new(0)..Hba::new(total_blocks as _));
         DiskView::new(range, disk)
     }
 

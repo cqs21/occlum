@@ -61,7 +61,7 @@ impl JinDisk {
         let superblock = SuperBlock::init(disk.total_blocks());
 
         let checkpoint_disk_view = Self::checkpoint_disk_view(&superblock, &disk);
-        let checkpoint = Arc::new(Checkpoint::new(&superblock, checkpoint_disk_view));
+        let checkpoint = Arc::new(Checkpoint::new(&superblock, checkpoint_disk_view, &root_key));
 
         let data_disk_view = Self::data_disk_view(&superblock, &disk);
         let data_cache = Arc::new(DataCache::new(
