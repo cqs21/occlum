@@ -272,7 +272,7 @@ impl JinDisk {
         self.lsm_tree.persist().await?;
 
         self.checkpoint
-            .persist(&self.superblock, &self.root_key)
+            .checkpoint(&self.superblock, &self.root_key)
             .await?;
 
         let disk_superblock_view = Self::superblock_disk_view(&self.disk);
@@ -301,7 +301,7 @@ impl JinDisk {
             self.disk.read(record.hba().to_offset(), buf).await?;
             let decrypted = DefaultCryptor::decrypt_block(
                 buf,
-                &self.checkpoint.key_table().get_or_insert(record.hba()),
+                &self.checkpoint.key_table().write().get_or_insert(record.hba()),
                 record.cipher_meta(),
             )?;
             buf.copy_from_slice(&decrypted);
@@ -348,7 +348,7 @@ impl JinDisk {
             for record in records {
                 let decrypted = DefaultCryptor::decrypt_block(
                     &rbuf[offset..offset + BLOCK_SIZE],
-                    &self.checkpoint.key_table().get_or_insert(record.hba()),
+                    &self.checkpoint.key_table().write().get_or_insert(record.hba()),
                     record.cipher_meta(),
                 )?;
                 offset += BLOCK_SIZE;

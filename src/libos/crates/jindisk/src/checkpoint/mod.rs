@@ -1,11 +1,6 @@
 //! Checkpoint region.
 use crate::prelude::*;
 use crate::SuperBlock;
-use crate::superblock::NR_DATA_SVT;
-use crate::superblock::NR_DST;
-use crate::superblock::NR_INDEX_SVT;
-use crate::superblock::NR_KEYTABLE;
-use crate::superblock::NR_RIT;
 use crate::util::DiskShadow;
 
 use std::fmt::{self, Debug};
@@ -30,10 +25,19 @@ pub struct Checkpoint {
     index_svt: RwLock<SVT>,
     dst: RwLock<DST>,
     rit: RwLock<RIT>,
-    key_table: KeyTable,
+    key_table: RwLock<KeyTable>,
+    shadow: RwLock<BitMap>,
     disk: DiskView,
 }
 // TODO: Introduce shadow paging for recovery
+
+const NR_BITC: usize = 0;
+const NR_DATA_SVT: usize = 1;
+const NR_INDEX_SVT: usize = 2;
+const NR_DST: usize = 3;
+const NR_RIT: usize = 4;
+const NR_KEYTABLE: usize = 5;
+const NR_REGION_MAX: usize = 6;
 
 impl Checkpoint {
     pub fn new(superblock: &SuperBlock, disk: DiskView, root_key: &Key) -> Self {
@@ -67,8 +71,19 @@ impl Checkpoint {
             keytable_addr..keytable_addr + (keytable_blocks as _)
         );
 
+        let bitc_addr = superblock.checkpoint_region.bitc_addr;
+        let bitc_blocks = BITC::calc_bitc_blocks(superblock.num_index_segments);
+        let bitc_boundary = HbaRange::new(
+            bitc_addr..bitc_addr + (bitc_blocks as _)
+        );
+
         Self {
-            bitc: RwLock::new(BITC::new()),
+            bitc: RwLock::new(BITC::new(
+                superblock.index_region_addr,
+                bitc_boundary,
+                disk.clone(),
+                root_key.clone()
+            )),
             data_svt: RwLock::new(SVT::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
@@ -98,12 +113,15 @@ impl Checkpoint {
                 disk.clone(),
                 root_key.clone()
             )),
-            key_table: KeyTable::new(
+            key_table: RwLock::new(KeyTable::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
                 keytable_boundary,
                 disk.clone(),
                 root_key.clone()
+            )),
+            shadow: RwLock::new(
+                BitMap::repeat(false, NR_REGION_MAX)
             ),
             disk,
         }
@@ -129,7 +147,7 @@ impl Checkpoint {
         &self.rit
     }
 
-    pub fn key_table(&self) -> &KeyTable {
+    pub fn key_table(&self) -> &RwLock<KeyTable> {
         &self.key_table
     }
 }
@@ -139,7 +157,7 @@ impl Checkpoint {
         let region = &superblock.checkpoint_region;
         self.bitc
             .write()
-            .persist(&self.disk, region.bitc_addr, root_key)
+            .persist()
             .await?;
         self.data_svt
             .write()
@@ -155,15 +173,22 @@ impl Checkpoint {
             .await?;
         self.rit.write().persist().await?;
         self.key_table
+            .write()
             .persist()
             .await?;
         Ok(())
     }
 
     pub async fn load(disk: &DiskView, superblock: &SuperBlock, root_key: &Key) -> Result<Self> {
-        let region = &superblock.checkpoint_region;
-        let bitc = BITC::load(disk, region.bitc_addr, root_key).await?;
-        bitc.init_bit_caches(disk).await?;
+        let mut buf = [0u8; BLOCK_SIZE];
+        match disk.read(superblock.checkpoint_region.region_addr, &mut buf).await {
+            Ok(_) => (),
+            Err(_) => {
+                // try read backup
+                disk.read(superblock.checkpoint_region.region_addr + 1, &mut buf).await?;
+            }
+        }
+        let shadow = BitMap::decode(&buf)?;
 
         let data_svt_addr = superblock.checkpoint_region.data_svt_addr;
         let data_svt_blocks = SVT::calc_svt_blocks(superblock.num_data_segments);
@@ -177,7 +202,7 @@ impl Checkpoint {
             data_svt_boundary,
             disk.clone(),
             root_key.clone(),
-            superblock.checkpoint_region.shadow[NR_DATA_SVT]
+            shadow[NR_DATA_SVT]
         ).await?;
 
         let index_svt_addr = superblock.checkpoint_region.index_svt_addr;
@@ -192,8 +217,22 @@ impl Checkpoint {
             index_svt_boundary,
             disk.clone(),
             root_key.clone(),
-            superblock.checkpoint_region.shadow[NR_INDEX_SVT]
+            shadow[NR_INDEX_SVT]
         ).await?;
+
+        let bitc_addr = superblock.checkpoint_region.bitc_addr;
+        let bitc_blocks = BITC::calc_bitc_blocks(superblock.num_index_segments);
+        let bitc_boundary = HbaRange::new(
+            bitc_addr..bitc_addr + (bitc_blocks as _)
+        );
+        let bitc = BITC::load(
+            &index_svt,
+            bitc_boundary,
+            disk.clone(),
+            root_key.clone(),
+            shadow[NR_BITC]
+        ).await?;
+        bitc.init_bit_caches(disk).await?;
 
         let dst_addr = superblock.checkpoint_region.dst_addr;
         let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
@@ -206,7 +245,7 @@ impl Checkpoint {
             dst_boundary,
             disk.clone(),
             root_key.clone(),
-            superblock.checkpoint_region.shadow[NR_DST]
+            shadow[NR_DST]
         ).await?;
 
         let rit_addr = superblock.checkpoint_region.rit_addr;
@@ -219,7 +258,7 @@ impl Checkpoint {
             rit_boundary,
             disk.clone(),
             root_key.clone(),
-            superblock.checkpoint_region.shadow[NR_RIT]
+            shadow[NR_RIT]
         ).await?;
 
         let keytable_addr = superblock.checkpoint_region.keytable_addr;
@@ -233,7 +272,7 @@ impl Checkpoint {
             keytable_boundary,
             disk.clone(),
             root_key.clone(),
-            superblock.checkpoint_region.shadow[NR_KEYTABLE]
+            shadow[NR_KEYTABLE]
         ).await?;
 
         Ok(Self {
@@ -242,22 +281,32 @@ impl Checkpoint {
             index_svt: RwLock::new(index_svt),
             dst: RwLock::new(dst),
             rit: RwLock::new(rit),
-            key_table,
+            key_table: RwLock::new(key_table),
+            shadow: RwLock::new(shadow),
             disk: disk.clone(),
         })
     }
-    pub async fn checkpoint(&mut self, superblock: &mut SuperBlock, root_key: &Key) -> Result<()> {
-        superblock.checkpoint_region.shadow[NR_DATA_SVT] = self.data_svt.write().checkpoint().await?;
-        superblock.checkpoint_region.shadow[NR_INDEX_SVT] = self.index_svt.write().checkpoint().await?;
-        superblock.checkpoint_region.shadow[NR_DST] = self.dst.write().checkpoint().await?;
-        superblock.checkpoint_region.shadow[NR_RIT] = self.rit.write().checkpoint().await?;
-        superblock.checkpoint_region.shadow[NR_KEYTABLE] = self.key_table.checkpoint().await?;
-        // TODO: using checkpoint() for BITC, KeyTable
-        let region = &superblock.checkpoint_region;
-        self.bitc
-            .write()
-            .persist(&self.disk, region.bitc_addr, root_key)
-            .await?;
+    pub async fn checkpoint(&self, superblock: &SuperBlock, _key: &Key) -> Result<()> {
+        self.shadow.write().set(NR_DATA_SVT, self.data_svt.write().checkpoint().await?);
+        self.shadow.write().set(NR_INDEX_SVT, self.index_svt.write().checkpoint().await?);
+        self.shadow.write().set(NR_DST, self.dst.write().checkpoint().await?);
+        self.shadow.write().set(NR_RIT, self.rit.write().checkpoint().await?);
+        self.shadow.write().set(NR_KEYTABLE, self.key_table().write().checkpoint().await?);
+        self.shadow.write().set(NR_BITC, self.bitc().write().checkpoint().await?);
+
+        let mut buf = [0u8; BLOCK_SIZE];
+        let mut encoder = Vec::<u8>::new();
+        let shadow = self.shadow.read();
+        shadow.encode(&mut encoder)?;
+        buf[..encoder.len()].copy_from_slice(&encoder);
+
+        // TODO: encrypt shadow bitmap
+
+        let shadow_addr = superblock.checkpoint_region.region_addr;
+        // write to bitmap backup block
+        self.disk.write(shadow_addr + 1, &buf).await?;
+        // write to bitmap block
+        self.disk.write(shadow_addr, &buf).await?;
         Ok(())
     }
 }
@@ -329,7 +378,7 @@ impl Debug for Checkpoint {
             .field("Index_SVT", &self.index_svt.read())
             .field("DST", &self.dst.read())
             .field("RIT", &self.rit.read())
-            .field("KeyTable", &self.key_table)
+            .field("KeyTable", &self.key_table.read())
             .finish()
     }
 }
@@ -348,7 +397,7 @@ mod tests {
             let root_key = DefaultCryptor::gen_random_key();
             let mut sb = SuperBlock::init(total_blocks);
             let mut checkpoint = Checkpoint::new(&sb, disk.clone(), &root_key);
-            checkpoint.checkpoint(&mut sb, &root_key).await?;
+            checkpoint.checkpoint(&sb, &root_key).await?;
             let loaded_checkpoint = Checkpoint::load(&disk, &sb, &root_key).await?;
 
             assert_eq!(

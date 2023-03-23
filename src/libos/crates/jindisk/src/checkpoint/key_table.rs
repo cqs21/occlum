@@ -11,7 +11,7 @@ use std::fmt::{self, Debug};
 pub struct KeyTable {
     data_region_addr: Hba,
     num_data_segments: usize,
-    table: RwLock<HashMap<Hba, Key>>,
+    table: HashMap<Hba, Key>,
     disk_array: DiskArray<Key>
 }
 // TODO: Support on-demand loading using `DiskArray<_>`
@@ -28,14 +28,13 @@ impl KeyTable {
         Self {
             data_region_addr,
             num_data_segments,
-            table: RwLock::new(HashMap::new()),
+            table: HashMap::new(),
             disk_array: DiskArray::new(DiskShadow::new(keytable_boundary, disk), key)
         }
     }
 
-    pub fn get_or_insert(&self, block_addr: Hba) -> Key {
+    pub fn get_or_insert(&mut self, block_addr: Hba) -> Key {
         self.table
-            .write()
             .entry(Hba::new(align_down(
                 (block_addr - self.data_region_addr.to_raw()).to_raw() as _,
                 NUM_BLOCKS_PER_SEGMENT,
@@ -45,7 +44,7 @@ impl KeyTable {
     }
 
     pub fn size(&self) -> usize {
-        self.table.read().len()
+        self.table.len()
     }
 
     /// Calculate KeyTable blocks without shadow block
@@ -93,16 +92,15 @@ impl KeyTable {
         Ok(Self {
             data_region_addr,
             num_data_segments,
-            table: RwLock::new(table),
+            table,
             disk_array
         })
     }
 
     pub async fn checkpoint(&mut self) -> Result<bool> {
-        for (seg_addr, key) in self.table.read().iter() {
-            let offset = ((seg_addr.to_raw() - self.data_region_addr.to_raw()) as usize) / NUM_BLOCKS_PER_SEGMENT;
+        for (seg_addr, key) in self.table.iter() {
+            let offset = (seg_addr.to_raw() as usize)/ NUM_BLOCKS_PER_SEGMENT;
             let value = key.clone();
-            println!("offset {}", offset);
             self.disk_array.set(offset, value).await?;
         }
         self.disk_array.checkpoint().await
@@ -141,7 +139,7 @@ mod tests {
         let keytable_end = keytable_start + (keytable_blocks as _);
         let keytable_boundary = HbaRange::new(keytable_start..keytable_end);
         let key = DefaultCryptor::gen_random_key();
-        let keytable = KeyTable::new(
+        let mut keytable = KeyTable::new(
             data_region_addr,
             num_data_segments,
             keytable_boundary,

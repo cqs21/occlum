@@ -57,7 +57,7 @@ impl BitBuilder {
         // Write back BIT content to disk
         disk.write(self.addr, self.buf.as_slice()).await?;
 
-        Ok(Bit::new(disk_bit, self.cache.clone()))
+        Ok(Bit::from(disk_bit, self.cache.clone()))
     }
 
     /// Build a BIT with an array of internal records.

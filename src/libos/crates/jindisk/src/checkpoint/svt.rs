@@ -54,12 +54,20 @@ impl SVT {
         self.num_allocated = self.num_allocated.saturating_sub(1);
     }
 
+    pub fn region_addr(&self) -> Hba {
+        self.region_addr
+    }
+
     pub fn num_segments(&self) -> usize {
         self.num_segments
     }
 
     pub fn num_allocated(&self) -> usize {
         self.num_allocated
+    }
+
+    pub fn bitmap(&self) -> &BitMap {
+        &self.bitmap
     }
 
     fn find_avail_seg(&self) -> Result<Hba> {
@@ -73,7 +81,7 @@ impl SVT {
         return_errno!(ENOMEM, "no available memory for segment");
     }
 
-    fn invalidate_seg(&mut self, seg_addr: Hba) {
+    pub fn invalidate_seg(&mut self, seg_addr: Hba) {
         let idx = self.calc_bitmap_idx(seg_addr);
         self.bitmap.set(idx, false);
     }

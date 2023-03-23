@@ -354,7 +354,7 @@ impl SegmentBuffer {
                     lba,
                     DefaultCryptor::encrypt_block(
                         data_block.as_slice(),
-                        &self.checkpoint.key_table().get_or_insert(block_addr),
+                        &self.checkpoint.key_table().write().get_or_insert(block_addr),
                     ),
                 )
             })

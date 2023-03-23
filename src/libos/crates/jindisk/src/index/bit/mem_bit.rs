@@ -19,7 +19,14 @@ pub struct Bit {
 }
 
 impl Bit {
-    pub fn new(bit: DiskBit, cache: Arc<BitCache>) -> Self {
+    pub fn new(bit: DiskBit) -> Self {
+        Self {
+            bit,
+            cache: Arc::new(BitCache::new(BIT_CACHE_CAPACITY))
+        }
+    }
+
+    pub fn from(bit: DiskBit, cache: Arc<BitCache>) -> Self {
         Self { bit, cache }
     }
 

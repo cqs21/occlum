@@ -1,7 +1,10 @@
 //! Block Index Table Catalog (BITC).
+use crate::index::bit::disk_bit::DiskBit;
 use crate::index::bit::{Bit, BitId, BIT_SIZE};
 use crate::index::LsmLevel;
 use crate::prelude::*;
+use crate::util::DiskShadow;
+use super::SVT;
 
 use std::convert::TryInto;
 use std::fmt::{self, Debug};
@@ -12,14 +15,23 @@ pub struct BITC {
     max_bit_version: u32,
     l0_bit: Option<Bit>,
     l1_bits: Vec<Bit>,
+    index_region_addr: Hba,
+    disk_array: DiskArray<DiskBit>
 }
 
 impl BITC {
-    pub fn new() -> Self {
+    pub fn new(
+        index_region_addr: Hba,
+        bitc_boundary: HbaRange,
+        disk: DiskView,
+        key: Key
+    ) -> Self {
         Self {
             max_bit_version: 0,
             l0_bit: None,
             l1_bits: Vec::new(),
+            index_region_addr,
+            disk_array: DiskArray::new(DiskShadow::new(bitc_boundary, disk), key)
         }
     }
 
@@ -124,66 +136,83 @@ impl BITC {
         Ok(())
     }
 
-    pub fn from(max_bit_version: u32, l0_bit: Option<Bit>, l1_bits: Vec<Bit>) -> Self {
-        Self {
+    fn calc_diskarray_offset(&self, bit_addr: Hba) -> usize {
+        (bit_addr.to_offset() - self.index_region_addr.to_offset()) / INDEX_SEGMENT_SIZE
+    }
+
+    /// Calculate BITC blocks without shadow block
+    pub fn calc_bitc_blocks(num_index_segments: usize) -> usize {
+        DiskArray::<DiskBit>::total_blocks(num_index_segments)
+    }
+
+    /// Calculate space cost (with shadow blocks) on disk.
+    pub fn calc_size_on_disk(num_index_segments: usize) -> usize {
+        let total_blocks = DiskArray::<DiskBit>::total_blocks_with_shadow(num_index_segments);
+        total_blocks * BLOCK_SIZE
+    }
+}
+
+impl BITC {
+    pub async fn persist(&self) -> Result<()> {
+        // TODO: write to disk_array
+        self.disk_array.persist().await
+    }
+
+    pub async fn load(
+        index_svt: &SVT,
+        bitc_boundary: HbaRange,
+        disk: DiskView,
+        key: Key,
+        shadow: bool
+    ) -> Result<Self> {
+        let disk_shadow = DiskShadow::load(bitc_boundary, disk, shadow).await?;
+        let mut disk_array = DiskArray::new(disk_shadow, key);
+
+        let mut max_bit_version = 0;
+        let mut l0_bit = None;
+        let mut l1_bits = Vec::new();
+        for offset in index_svt.bitmap().iter_zeros() {
+            let bit: DiskBit = disk_array.get(offset).await.ok_or(
+                errno!(EIO, "bitc disk_array read error")
+            )?;
+            if max_bit_version < *bit.version() {
+                max_bit_version = *bit.version();
+            }
+            match *bit.level() {
+                0 => {
+                    l0_bit = Some(Bit::new(bit))
+                },
+                1 => {
+                    l1_bits.push(Bit::new(bit));
+                },
+                _ => {
+                    return_errno!(EINVAL, "bitc load: illegal LsmLevel")
+                }
+            }
+        }
+        Ok(Self {
             max_bit_version,
             l0_bit,
             l1_bits,
-        }
+            index_region_addr: index_svt.region_addr(),
+            disk_array
+        })
     }
 
-    /// Calculate space cost on disk.
-    pub fn calc_size_on_disk(num_index_segments: usize) -> usize {
-        let size = num_index_segments * BIT_SIZE + AUTH_ENC_MAC_SIZE + USIZE_SIZE;
-        align_up(size, BLOCK_SIZE)
-    }
-}
-
-impl Serialize for BITC {
-    fn encode(&self, encoder: &mut impl Encoder) -> Result<()> {
-        encoder.write_bytes(&self.max_bit_version.to_le_bytes())?;
-        if self.max_bit_version == 0 {
-            return Ok(());
+    pub async fn checkpoint(&mut self) -> Result<bool> {
+        if let Some(bit) = &self.l0_bit {
+            let offset = self.calc_diskarray_offset(bit.addr());
+            let disk_bit = bit.bit().clone();
+            self.disk_array.set(offset, disk_bit).await?;
         }
-        self.l0_bit.as_ref().unwrap().encode(encoder)?;
-        self.l1_bits.len().encode(encoder)?;
-        for l1_bit in &self.l1_bits {
-            l1_bit.encode(encoder)?;
+        for bit in &self.l1_bits {
+            let offset = self.calc_diskarray_offset(bit.addr());
+            let disk_bit = bit.bit().clone();
+            self.disk_array.set(offset, disk_bit).await?
         }
-        Ok(())
-    }
-
-    fn decode(buf: &[u8]) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let mut offset = 0;
-        let decode_err = EINVAL;
-        let max_bit_version = u32::from_le_bytes(
-            buf[offset..offset + U32_SIZE]
-                .try_into()
-                .map_err(|_| decode_err)?,
-        );
-        offset += U32_SIZE;
-        if max_bit_version == 0 {
-            return Ok(Self::new());
-        }
-        let l0_bit = Some(Bit::decode(&buf[offset..offset + BIT_SIZE])?);
-        offset += BIT_SIZE;
-
-        let l1_len = usize::decode(&buf[offset..offset + USIZE_SIZE])?;
-        offset += USIZE_SIZE;
-        let mut l1_bits = Vec::with_capacity(l1_len);
-        for _ in 0..l1_len {
-            l1_bits.push(Bit::decode(&buf[offset..offset + BIT_SIZE])?);
-            offset += BIT_SIZE;
-        }
-
-        Ok(BITC::from(max_bit_version, l0_bit, l1_bits))
+        self.disk_array.checkpoint().await
     }
 }
-
-crate::persist_load_checkpoint_region! {BITC}
 
 impl Debug for BITC {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -197,12 +226,36 @@ impl Debug for BITC {
 
 #[cfg(test)]
 mod tests {
+    use crate::index::record::RootRecord;
+
     use super::*;
     use block_device::mem_disk::MemDisk;
 
     #[test]
     fn test_bitc_fns() {
-        let mut bitc = BITC::new();
+        let disk_blocks = 256 * MiB / BLOCK_SIZE;
+        let disk = Arc::new(MemDisk::new(disk_blocks).unwrap());
+        let disk = DiskView::new_unchecked(disk);
+
+        let index_region_addr = Hba::new(0);
+        let num_index_segments = 57usize;
+        let bitc_blocks = BITC::calc_bitc_blocks(num_index_segments);
+        let bitc_blocks_with_shadow = BITC::calc_size_on_disk(num_index_segments) / BLOCK_SIZE;
+        // size_of::<DiskBit>() -> 72B, (4096 - 16) / 72 = 56
+        assert_eq!(bitc_blocks, 2);
+        assert_eq!(bitc_blocks_with_shadow, 6);
+
+        let bitc_start = index_region_addr + (NUM_BLOCKS_PER_SEGMENT * num_index_segments) as _;
+        let bitc_end = bitc_start + (bitc_blocks as _);
+        let bitc_boundary = HbaRange::new(bitc_start..bitc_end);
+        let key = DefaultCryptor::gen_random_key();
+        let mut bitc = BITC::new(
+            index_region_addr,
+            bitc_boundary,
+            disk,
+            key
+        );
+
         let level0 = 0 as LsmLevel;
         let level1 = 1 as LsmLevel;
 
@@ -252,37 +305,80 @@ mod tests {
     }
 
     #[test]
-    fn test_bitc_serialize() {
-        let mut bitc = BITC::new();
-        bitc.assign_version();
-        let id = BitId::from_byte_offset(5 * INDEX_SEGMENT_SIZE);
-        bitc.insert_bit(
-            Bit::new_unchecked(id, LbaRange::new(Lba::new(0)..Lba::new(9))),
-            0 as LsmLevel,
-        );
-        bitc.insert_bit(
-            Bit::new_unchecked(BitId::new(0), LbaRange::new(Lba::new(10)..Lba::new(19))),
-            1 as LsmLevel,
-        );
-
-        let mut bytes = Vec::new();
-        bitc.encode(&mut bytes).unwrap();
-        let decoded_bitc = BITC::decode(&bytes).unwrap();
-
-        assert_eq!(*decoded_bitc.l0_bit().unwrap().id(), id);
-        assert_eq!(format!("{:?}", bitc), format!("{:?}", decoded_bitc));
-    }
-
-    #[test]
     fn test_bitc_persist_load() -> Result<()> {
         async_rt::task::block_on(async move {
-            let bitc = BITC::new();
-            let disk = Arc::new(MemDisk::new(1024usize).unwrap());
+            let disk_blocks = 256 * MiB / BLOCK_SIZE;
+            let disk = Arc::new(MemDisk::new(disk_blocks).unwrap());
             let disk = DiskView::new_unchecked(disk);
-            let root_key = DefaultCryptor::gen_random_key();
 
-            bitc.persist(&disk, Hba::new(0), &root_key).await?;
-            let loaded_bitc = BITC::load(&disk, Hba::new(0), &root_key).await?;
+            let index_region_addr = Hba::new(0);
+            let num_index_segments = 57usize;
+            let bitc_blocks = BITC::calc_bitc_blocks(num_index_segments);
+            let bitc_start = index_region_addr + (NUM_BLOCKS_PER_SEGMENT * num_index_segments) as _;
+            let bitc_end = bitc_start + (bitc_blocks as _);
+            let bitc_boundary = HbaRange::new(bitc_start..bitc_end);
+            let key = DefaultCryptor::gen_random_key();
+
+            let mut bitc = BITC::new(
+                index_region_addr,
+                bitc_boundary.clone(),
+                disk.clone(),
+                key.clone()
+            );
+
+            let mut fake_svt = SVT::new(
+                index_region_addr,
+                num_index_segments,
+                INDEX_SEGMENT_SIZE,
+                HbaRange::new(bitc_end..bitc_end + 1u64),
+                disk.clone(),
+                key.clone()
+            );
+
+            let bit_addr = Hba::from_byte_offset(5 * INDEX_SEGMENT_SIZE);
+            fake_svt.invalidate_seg(bit_addr);
+            let version = bitc.assign_version();
+            bitc.insert_bit(
+                Bit::new(DiskBit::new(
+                    bit_addr,
+                    version,
+                    0,
+                    RootRecord::new(
+                        LbaRange::new(Lba::new(20)..Lba::new(29)),
+                        Hba::new(0),
+                        CipherMeta::new_uninit()
+                    ),
+                    DefaultCryptor::gen_random_key()
+                )),
+                0,
+            );
+            let bit_addr = Hba::from_byte_offset(2 * INDEX_SEGMENT_SIZE);
+            fake_svt.invalidate_seg(bit_addr);
+            let version = bitc.assign_version();
+            bitc.insert_bit(
+                Bit::new(DiskBit::new(
+                    bit_addr,
+                    version,
+                    1,
+                    RootRecord::new(
+                        LbaRange::new(Lba::new(10)..Lba::new(19)),
+                        Hba::new(0),
+                        CipherMeta::new_uninit()
+                    ),
+                    DefaultCryptor::gen_random_key()
+                )),
+                1,
+            );
+
+            bitc.checkpoint().await?;
+
+            let loaded_bitc = BITC::load(
+                &fake_svt,
+                bitc_boundary.clone(),
+                disk.clone(),
+                key.clone(),
+                true
+            ).await?;
 
             assert_eq!(format!("{:?}", bitc), format!("{:?}", loaded_bitc));
             Ok(())
