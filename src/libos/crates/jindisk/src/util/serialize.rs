@@ -94,6 +94,23 @@ impl Serialize for usize {
     }
 }
 
+impl Serialize for u8 {
+    fn encode(&self, encoder: &mut impl Encoder) -> Result<()> {
+        encoder.write_bytes(&[*self])
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(buf[0])
+    }
+
+    fn bytes_len(&self) -> Option<usize> {
+        Some(size_of::<u8>())
+    }
+}
+
 impl<K: Serialize + std::cmp::Eq + std::hash::Hash, V: Serialize> Serialize for HashMap<K, V> {
     fn encode(&self, encoder: &mut impl Encoder) -> Result<()> {
         let cap = self.len();

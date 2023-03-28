@@ -51,17 +51,33 @@ impl Checkpoint {
         let keytable_boundary =
             HbaRange::new(keytable_addr..keytable_addr + (keytable_blocks as _));
 
+        let data_svt_addr = superblock.checkpoint_region.data_svt_addr;
+        let data_svt_blocks = SVT::calc_svt_blocks(superblock.num_data_segments);
+        let data_svt_boundary =
+            HbaRange::new(data_svt_addr..data_svt_addr + (data_svt_blocks as _));
+
+        let index_svt_addr = superblock.checkpoint_region.index_svt_addr;
+        let index_svt_blocks = SVT::calc_svt_blocks(superblock.num_index_segments);
+        let index_svt_boundary =
+            HbaRange::new(index_svt_addr..index_svt_addr + (index_svt_blocks as _));
+
         Self {
             bitc: RwLock::new(BITC::new()),
             data_svt: RwLock::new(SVT::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
                 SEGMENT_SIZE,
+                data_svt_boundary,
+                disk.clone(),
+                root_key.clone(),
             )),
             index_svt: RwLock::new(SVT::new(
                 superblock.index_region_addr,
                 superblock.num_index_segments,
                 INDEX_SEGMENT_SIZE,
+                index_svt_boundary,
+                disk.clone(),
+                root_key.clone(),
             )),
             dst: RwLock::new(DST::new(
                 superblock.data_region_addr,
@@ -127,14 +143,13 @@ impl Checkpoint {
             .write()
             .persist(&self.disk, region.bitc_addr, root_key)
             .await?;
-        self.data_svt
-            .write()
-            .persist(&self.disk, region.data_svt_addr, root_key)
-            .await?;
-        self.index_svt
-            .write()
-            .persist(&self.disk, region.index_svt_addr, root_key)
-            .await?;
+
+        let data_svt_shadow = self.data_svt.write().persist(checkpoint).await?;
+        self.shadow.write().set(NR_DATA_SVT, data_svt_shadow);
+
+        let index_svt_shadow = self.index_svt.write().persist(checkpoint).await?;
+        self.shadow.write().set(NR_INDEX_SVT, index_svt_shadow);
+
         self.dst
             .write()
             .persist(&self.disk, region.dst_addr, root_key)
@@ -174,8 +189,37 @@ impl Checkpoint {
 
         let bitc = BITC::load(disk, region.bitc_addr, root_key).await?;
         bitc.init_bit_caches(disk).await?;
-        let data_svt = SVT::load(disk, region.data_svt_addr, root_key).await?;
-        let index_svt = SVT::load(disk, region.index_svt_addr, root_key).await?;
+
+        let data_svt_addr = superblock.checkpoint_region.data_svt_addr;
+        let data_svt_blocks = SVT::calc_svt_blocks(superblock.num_data_segments);
+        let data_svt_boundary =
+            HbaRange::new(data_svt_addr..data_svt_addr + (data_svt_blocks as _));
+        let data_svt = SVT::load(
+            superblock.data_region_addr,
+            superblock.num_data_segments,
+            SEGMENT_SIZE,
+            data_svt_boundary,
+            disk.clone(),
+            root_key.clone(),
+            shadow[NR_DATA_SVT],
+        )
+        .await?;
+
+        let index_svt_addr = superblock.checkpoint_region.index_svt_addr;
+        let index_svt_blocks = SVT::calc_svt_blocks(superblock.num_index_segments);
+        let index_svt_boundary =
+            HbaRange::new(index_svt_addr..index_svt_addr + (index_svt_blocks as _));
+        let index_svt = SVT::load(
+            superblock.index_region_addr,
+            superblock.num_index_segments,
+            INDEX_SEGMENT_SIZE,
+            index_svt_boundary,
+            disk.clone(),
+            root_key.clone(),
+            shadow[NR_INDEX_SVT],
+        )
+        .await?;
+
         let dst = DST::load(disk, region.dst_addr, root_key).await?;
 
         let rit_addr = superblock.checkpoint_region.rit_addr;
