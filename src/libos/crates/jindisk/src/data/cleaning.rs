@@ -162,7 +162,13 @@ impl Inner {
             self.disk.read(record.hba(), &mut rbuf).await?;
             let decrypted = DefaultCryptor::decrypt_block(
                 &rbuf,
-                &self.checkpoint.key_table().get_or_insert(record.hba()),
+                &self
+                    .checkpoint
+                    .key_table()
+                    .write()
+                    .await
+                    .get_or_insert(record.hba())
+                    .await?,
                 record.cipher_meta(),
             )?;
             rbuf.copy_from_slice(&decrypted);

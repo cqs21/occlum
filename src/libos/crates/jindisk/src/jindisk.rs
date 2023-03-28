@@ -311,7 +311,13 @@ impl JinDisk {
             self.disk.read(record.hba().to_offset(), buf).await?;
             let decrypted = DefaultCryptor::decrypt_block(
                 buf,
-                &self.checkpoint.key_table().get_or_insert(record.hba()),
+                &self
+                    .checkpoint
+                    .key_table()
+                    .write()
+                    .await
+                    .get_or_insert(record.hba())
+                    .await?,
                 record.cipher_meta(),
             )?;
             buf.copy_from_slice(&decrypted);
@@ -369,7 +375,13 @@ impl JinDisk {
             for record in records {
                 let decrypted = DefaultCryptor::decrypt_block(
                     &rbuf[offset..offset + BLOCK_SIZE],
-                    &self.checkpoint.key_table().get_or_insert(record.hba()),
+                    &self
+                        .checkpoint
+                        .key_table()
+                        .write()
+                        .await
+                        .get_or_insert(record.hba())
+                        .await?,
                     record.cipher_meta(),
                 )?;
                 offset += BLOCK_SIZE;

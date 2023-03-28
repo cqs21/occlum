@@ -25,7 +25,7 @@ pub struct Checkpoint {
     index_svt: RwLock<SVT>,
     dst: RwLock<DST>,
     rit: AsyncRwLock<RIT>,
-    key_table: KeyTable,
+    key_table: AsyncRwLock<KeyTable>,
     shadow: RwLock<BitMap>,
     disk: DiskView,
 }
@@ -45,6 +45,11 @@ impl Checkpoint {
         let rit_addr = superblock.checkpoint_region.rit_addr;
         let rit_blocks = RIT::calc_rit_blocks(superblock.num_data_segments);
         let rit_boundary = HbaRange::new(rit_addr..rit_addr + (rit_blocks as _));
+
+        let keytable_addr = superblock.checkpoint_region.keytable_addr;
+        let keytable_blocks = KeyTable::calc_keytable_blocks(superblock.num_data_segments);
+        let keytable_boundary =
+            HbaRange::new(keytable_addr..keytable_addr + (keytable_blocks as _));
 
         Self {
             bitc: RwLock::new(BITC::new()),
@@ -69,7 +74,13 @@ impl Checkpoint {
                 disk.clone(),
                 root_key.clone(),
             )),
-            key_table: KeyTable::new(superblock.data_region_addr),
+            key_table: AsyncRwLock::new(KeyTable::new(
+                superblock.data_region_addr,
+                superblock.num_data_segments,
+                keytable_boundary,
+                disk.clone(),
+                root_key.clone(),
+            )),
             shadow: RwLock::new(BitMap::repeat(false, NR_REGION_MAX)),
             disk,
         }
@@ -95,7 +106,7 @@ impl Checkpoint {
         &self.rit
     }
 
-    pub fn key_table(&self) -> &KeyTable {
+    pub fn key_table(&self) -> &AsyncRwLock<KeyTable> {
         &self.key_table
     }
 }
@@ -130,9 +141,9 @@ impl Checkpoint {
             .await?;
         let rit_shadow = self.rit.write().await.persist(checkpoint).await?;
         self.shadow.write().set(NR_RIT, rit_shadow);
-        self.key_table
-            .persist(&self.disk, region.keytable_addr, root_key)
-            .await?;
+
+        let keytable_shadow = self.key_table.write().await.persist(checkpoint).await?;
+        self.shadow.write().set(NR_KEYTABLE, keytable_shadow);
 
         if checkpoint {
             self.checkpoint(superblock, root_key).await?;
@@ -179,7 +190,20 @@ impl Checkpoint {
             shadow[NR_RIT],
         )
         .await?;
-        let key_table = KeyTable::load(disk, region.keytable_addr, root_key).await?;
+
+        let keytable_addr = superblock.checkpoint_region.keytable_addr;
+        let keytable_blocks = KeyTable::calc_keytable_blocks(superblock.num_data_segments);
+        let keytable_boundary =
+            HbaRange::new(keytable_addr..keytable_addr + (keytable_blocks as _));
+        let key_table = KeyTable::load(
+            superblock.data_region_addr,
+            superblock.num_data_segments,
+            keytable_boundary,
+            disk.clone(),
+            root_key.clone(),
+            shadow[NR_KEYTABLE],
+        )
+        .await?;
 
         Ok(Self {
             bitc: RwLock::new(bitc),
@@ -187,7 +211,7 @@ impl Checkpoint {
             index_svt: RwLock::new(index_svt),
             dst: RwLock::new(dst),
             rit: AsyncRwLock::new(rit),
-            key_table,
+            key_table: AsyncRwLock::new(key_table),
             shadow: RwLock::new(shadow),
             disk: disk.clone(),
         })
@@ -329,7 +353,7 @@ impl Debug for Checkpoint {
             .field("Index_SVT", &self.index_svt.read())
             .field("DST", &self.dst.read())
             .field("RIT", &())
-            .field("KeyTable", &self.key_table)
+            .field("KeyTable", &())
             .finish()
     }
 }

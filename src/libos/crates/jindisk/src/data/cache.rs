@@ -385,18 +385,18 @@ impl SegmentBuffer {
         let mut sorted_pb = data_blocks.iter().collect::<Vec<_>>();
         sorted_pb.sort_by_key(|kv| kv.0);
         // Encrypt each block
-        let mut sorted_cb = sorted_pb
-            .iter()
-            .map(|(&lba, data_block)| {
-                (
-                    lba,
-                    DefaultCryptor::encrypt_block(
-                        data_block.as_slice(),
-                        &self.checkpoint.key_table().get_or_insert(block_addr),
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut sorted_cb = Vec::<(Lba, CipherBlock)>::new();
+        for (&lba, data_block) in sorted_pb.iter() {
+            let key = self
+                .checkpoint
+                .key_table()
+                .write()
+                .await
+                .get_or_insert(block_addr)
+                .await?;
+            let cipher_block = DefaultCryptor::encrypt_block(data_block.as_slice(), &key);
+            sorted_cb.push((lba, cipher_block));
+        }
         drop(data_blocks);
 
         let mut wbufs = Vec::with_capacity(self.capacity);
