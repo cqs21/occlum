@@ -65,8 +65,18 @@ impl Checkpoint {
         let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
         let dst_boundary = HbaRange::new(dst_addr..dst_addr + (dst_blocks as _));
 
+        let bitc_addr = superblock.checkpoint_region.bitc_addr;
+        let bitc_blocks = BITC::calc_bitc_blocks(superblock.num_index_segments);
+        let bitc_boundary = HbaRange::new(bitc_addr..bitc_addr + (bitc_blocks as _));
+
         Self {
-            bitc: RwLock::new(BITC::new()),
+            bitc: RwLock::new(BITC::new(
+                superblock.index_region_addr,
+                superblock.num_index_segments,
+                bitc_boundary,
+                disk.clone(),
+                root_key.clone(),
+            )),
             data_svt: RwLock::new(SVT::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
@@ -146,10 +156,8 @@ impl Checkpoint {
             return self.commit_pflag(&region, Pflag::Initialized).await;
         }
 
-        self.bitc
-            .write()
-            .persist(&self.disk, region.bitc_addr, root_key)
-            .await?;
+        let bitc_shadow = self.bitc().write().persist(checkpoint).await?;
+        self.shadow.write().set(NR_BITC, bitc_shadow);
 
         let data_svt_shadow = self.data_svt.write().persist(checkpoint).await?;
         self.shadow.write().set(NR_DATA_SVT, data_svt_shadow);
@@ -193,9 +201,6 @@ impl Checkpoint {
         let buf = DefaultCryptor::symm_decrypt_block(&buf, root_key)?;
         let shadow = BitMap::decode(&buf)?;
 
-        let bitc = BITC::load(disk, region.bitc_addr, root_key).await?;
-        bitc.init_bit_caches(disk).await?;
-
         let data_svt_addr = superblock.checkpoint_region.data_svt_addr;
         let data_svt_blocks = SVT::calc_svt_blocks(superblock.num_data_segments);
         let data_svt_boundary =
@@ -225,6 +230,19 @@ impl Checkpoint {
             shadow[NR_INDEX_SVT],
         )
         .await?;
+
+        let bitc_addr = superblock.checkpoint_region.bitc_addr;
+        let bitc_blocks = BITC::calc_bitc_blocks(superblock.num_index_segments);
+        let bitc_boundary = HbaRange::new(bitc_addr..bitc_addr + (bitc_blocks as _));
+        let bitc = BITC::load(
+            &index_svt,
+            bitc_boundary,
+            disk.clone(),
+            root_key.clone(),
+            shadow[NR_BITC],
+        )
+        .await?;
+        bitc.init_bit_caches(disk).await?;
 
         let dst_addr = superblock.checkpoint_region.dst_addr;
         let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
