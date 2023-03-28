@@ -61,6 +61,10 @@ impl Checkpoint {
         let index_svt_boundary =
             HbaRange::new(index_svt_addr..index_svt_addr + (index_svt_blocks as _));
 
+        let dst_addr = superblock.checkpoint_region.dst_addr;
+        let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
+        let dst_boundary = HbaRange::new(dst_addr..dst_addr + (dst_blocks as _));
+
         Self {
             bitc: RwLock::new(BITC::new()),
             data_svt: RwLock::new(SVT::new(
@@ -82,6 +86,9 @@ impl Checkpoint {
             dst: RwLock::new(DST::new(
                 superblock.data_region_addr,
                 superblock.num_data_segments,
+                dst_boundary,
+                disk.clone(),
+                root_key.clone(),
             )),
             rit: AsyncRwLock::new(RIT::new(
                 superblock.data_region_addr,
@@ -150,10 +157,9 @@ impl Checkpoint {
         let index_svt_shadow = self.index_svt.write().persist(checkpoint).await?;
         self.shadow.write().set(NR_INDEX_SVT, index_svt_shadow);
 
-        self.dst
-            .write()
-            .persist(&self.disk, region.dst_addr, root_key)
-            .await?;
+        let dst_shadow = self.dst().write().persist(checkpoint).await?;
+        self.shadow.write().set(NR_DST, dst_shadow);
+
         let rit_shadow = self.rit.write().await.persist(checkpoint).await?;
         self.shadow.write().set(NR_RIT, rit_shadow);
 
@@ -220,7 +226,18 @@ impl Checkpoint {
         )
         .await?;
 
-        let dst = DST::load(disk, region.dst_addr, root_key).await?;
+        let dst_addr = superblock.checkpoint_region.dst_addr;
+        let dst_blocks = DST::calc_dst_blocks(superblock.num_data_segments);
+        let dst_boundary = HbaRange::new(dst_addr..dst_addr + (dst_blocks as _));
+        let dst = DST::load(
+            superblock.data_region_addr,
+            superblock.num_data_segments,
+            dst_boundary,
+            disk.clone(),
+            root_key.clone(),
+            shadow[NR_DST],
+        )
+        .await?;
 
         let rit_addr = superblock.checkpoint_region.rit_addr;
         let rit_blocks = RIT::calc_rit_blocks(superblock.num_data_segments);
